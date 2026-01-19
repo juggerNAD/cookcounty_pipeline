@@ -1,7 +1,7 @@
 import os
 import re
-import json
 import csv
+import json
 from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image, ImageEnhance, ImageOps
@@ -10,191 +10,167 @@ PDF_DIR = "pdf"
 PHASE3_CSV = "phase3_results.csv"
 PHASE3_JSON = "phase3_results.json"
 
-
 # =========================
-# WATERMARK-BOOSTED OCR
+# OCR — SCANNED PDF SAFE
 # =========================
 def ocr_pdf(pdf_path):
     try:
         images = convert_from_path(pdf_path, dpi=300)
         full_text = ""
 
-        tesseract_config = r"--oem 3 --psm 6"
-
         for img in images:
-            # Pass 1: Normal OCR
-            text1 = pytesseract.image_to_string(img, config=tesseract_config)
+            t1 = pytesseract.image_to_string(img, config="--oem 3 --psm 6")
 
-            # Pass 2: Watermark boost
             gray = img.convert("L")
             contrast = ImageEnhance.Contrast(gray).enhance(3.0)
+            sharp = ImageEnhance.Sharpness(contrast).enhance(2.0)
+            t2 = pytesseract.image_to_string(sharp, config="--oem 3 --psm 6")
+
             inverted = ImageOps.invert(contrast)
-            text2 = pytesseract.image_to_string(inverted, config=tesseract_config)
+            t3 = pytesseract.image_to_string(inverted, config="--oem 3 --psm 6")
 
-            full_text += text1 + "\n" + text2 + "\n"
+            full_text += "\n".join([t1, t2, t3]) + "\n"
 
-        # Normalize watermark spacing damage
-        full_text = full_text.upper()
-        full_text = re.sub(r"(\d)\s+(\d)", r"\1\2", full_text)
-        full_text = re.sub(r"C\s*H", "CH", full_text)
-        full_text = re.sub(r"F\s*C", "FC", full_text)
-        full_text = re.sub(r"\s+", " ", full_text)
+        text = full_text.upper()
+        text = re.sub(r"(\d)\s+(\d)", r"\1\2", text)
+        text = re.sub(r"\s+", " ", text)
 
-        return full_text.strip()
+        return text.strip()
 
     except Exception as e:
-        print(f"❌ OCR failed for {pdf_path}: {e}")
+        print(f"❌ OCR failed on {pdf_path}: {e}")
         return ""
 
-
 # =========================
-# CASE NUMBER (ROBUST)
+# CASE NUMBER — NO LETTER ASSUMPTIONS
 # =========================
 def extract_case_number(text):
-    patterns = [
-        r"\b\d{4}CH\d{3,6}\b",
-        r"\b\d{4}\s*CH\s*\d{3,6}\b",
-        r"\b\d{2}\s*CH\s*\d{3,6}\b",
-        r"\b\d{4}-CH-\d{3,6}\b",
-        r"\b\d{4}L\d{3,6}\b",
-        r"\b\d{4}\s*L\s*\d{3,6}\b",
-        r"\b\d{4}FC\d{3,6}\b",
-        r"\b\d{4}-M6-\d{3,6}\b",
-        r"\b\d{4}\s*P\s*\d{3,6}\b",
-        r"\b\d{2}\s*ED\s*\d{3,6}\b",
-    ]
+    pattern = re.compile(
+        r"\b(20\d{2}|\d{2})[\s\-]*[A-Z]{1,10}[\s\-]*\d{2,8}\b"
+    )
 
-    matches = []
-    for pat in patterns:
-        found = re.findall(pat, text, re.IGNORECASE)
-        for f in found:
-            cleaned = re.sub(r"\s+", "", f.upper())
-            matches.append(cleaned)
+    candidates = []
+    for m in pattern.finditer(text):
+        raw = m.group()
+        cleaned = re.sub(r"[\s\-]+", "", raw)
 
-    if not matches:
+        if not re.search(r"\d{2,8}$", cleaned):
+            continue
+
+        candidates.append(cleaned)
+
+    if not candidates:
         return "", 0.0
 
-    # Choose the longest / most complete case
-    best = max(matches, key=len)
+    best = max(candidates, key=len)
     return best, 0.95
 
-
 # =========================
-# AMOUNT (NO DUPLICATION)
+# AMOUNT — FIXED (NO INDEX ERROR)
 # =========================
 def extract_amount(text):
-    matches = re.findall(r"\$\s?[\d,]+\.\d{2}", text)
-    if not matches:
-        return "", 0.0
+    patterns = [
+        r"(?:AMOUNT CLAIMED|CLAIMED AMOUNT|TOTAL AMOUNT)[^$0-9]{0,40}(\$?\s?[\d,]+\.\d{2})",
+        r"(\$[\d,]+\.\d{2})"
+    ]
 
-    values = []
-    for m in matches:
-        try:
-            values.append(float(m.replace("$", "").replace(",", "")))
-        except:
-            pass
-
-    if not values:
-        return "", 0.0
-
-    return f"${max(values):,.2f}", 0.9
-
-
-# =========================
-# ADDRESS (STRICT)
-# =========================
-def extract_address(text):
-    # Full address pattern: street + city + state + zip
-    match = re.search(
-        r"\d{1,5}\s+[\w\s.#-]+,\s*[A-Z]{2}\s*\d{5}",
-        text
-    )
-    if match:
-        return match.group(0).strip(), 0.9
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            val = m.group(1)
+            val = val.replace("$", "").replace(",", "")
+            return f"${float(val):,.2f}", 0.9
 
     return "", 0.0
 
+# =========================
+# ADDRESS — US FORMAT
+# =========================
+def extract_address(text):
+    addr_pattern = re.compile(
+        r"\b\d{1,6}\s+[A-Z0-9 .,'\-]+?\s+"
+        r"(?:ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|CT|COURT|BLVD|LN|WAY)\b"
+        r".{0,40}?\b[A-Z]{2}\s*\d{5}\b"
+    )
+
+    m = addr_pattern.search(text)
+    if m:
+        return m.group(0).strip(), 0.9
+
+    return "", 0.0
 
 # =========================
-# PROCESS PDF
+# PROCESS SINGLE PDF
 # =========================
-def process_pdf(pdf_file, seen_cases):
-    pdf_path = os.path.join(PDF_DIR, pdf_file)
-    if not os.path.exists(pdf_path):
-        print(f"❌ PDF not found: {pdf_path}")
-        return None
+def process_pdf(pdf_file):
+    text = ocr_pdf(os.path.join(PDF_DIR, pdf_file))
 
-    text = ocr_pdf(pdf_path)
-
-    case_number, case_conf = extract_case_number(text)
-    amount, amount_conf = extract_amount(text)
-    address, addr_conf = extract_address(text)
-
-    if case_number and case_number in seen_cases:
-        print(f"⚠ Duplicate case skipped: {case_number}")
-        return None
+    case, c_conf = extract_case_number(text)
+    amt, a_conf = extract_amount(text)
+    addr, ad_conf = extract_address(text)
 
     return {
         "Source PDF": pdf_file,
-        "Case Number": case_number,
-        "Case Confidence": case_conf,
-        "Amount (USD)": amount,
-        "Amount Confidence": amount_conf,
-        "Address": address,
-        "Address Confidence": addr_conf
+        "Case Number": case,
+        "Case Confidence": c_conf,
+        "Amount (USD)": amt,
+        "Amount Confidence": a_conf,
+        "Address": addr,
+        "Address Confidence": ad_conf
     }
 
+# =========================
+# LOAD CSV STATE (RESUME)
+# =========================
+def load_csv_state():
+    completed = set()
+    if not os.path.exists(PHASE3_CSV):
+        return completed
+
+    with open(PHASE3_CSV, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            completed.add(row["Source PDF"])
+
+    return completed
 
 # =========================
-# SAVE RESULTS
+# SAVE RESULT (UPSERT)
 # =========================
 def save_result(result):
-    data = []
-    if os.path.exists(PHASE3_JSON):
-        with open(PHASE3_JSON, encoding="utf-8") as f:
-            data = json.load(f)
+    rows = []
 
-    data.append(result)
+    if os.path.exists(PHASE3_CSV):
+        with open(PHASE3_CSV, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+    rows = [r for r in rows if r["Source PDF"] != result["Source PDF"]]
+    rows.append(result)
+
+    with open(PHASE3_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=result.keys())
+        writer.writeheader()
+        writer.writerows(rows)
 
     with open(PHASE3_JSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
-
-    write_header = not os.path.exists(PHASE3_CSV)
-    with open(PHASE3_CSV, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=result.keys())
-        if write_header:
-            writer.writeheader()
-        writer.writerow(result)
-
+        json.dump(rows, f, indent=4)
 
 # =========================
-# BATCH PROCESS
+# MAIN LOOP
 # =========================
 def process_all_pdfs():
-    pdf_files = sorted(os.listdir(PDF_DIR))
-    seen_cases = set()
+    completed = load_csv_state()
 
-    if os.path.exists(PHASE3_JSON):
-        with open(PHASE3_JSON, encoding="utf-8") as f:
-            for item in json.load(f):
-                if item.get("Case Number"):
-                    seen_cases.add(item["Case Number"])
+    for pdf in sorted(os.listdir(PDF_DIR)):
+        if not pdf.lower().endswith(".pdf"):
+            continue
+        if pdf in completed:
+            continue
 
-    for idx, pdf_file in enumerate(pdf_files, 1):
-        print(f"[{idx}/{len(pdf_files)}] Processing {pdf_file}...")
-        result = process_pdf(pdf_file, seen_cases)
+        print(f"Processing {pdf}...")
+        result = process_pdf(pdf)
+        save_result(result)
+        print(f"✅ Done: {result['Case Number']}\n")
 
-        if result:
-            save_result(result)
-            if result["Case Number"]:
-                seen_cases.add(result["Case Number"])
-
-        print("✅ Done\n")
-
-
-# =========================
-# MAIN
-# =========================
 if __name__ == "__main__":
     process_all_pdfs()
-    print("🎯 Phase 3 COMPLETE")
+    print("🎯 PHASE 3 COMPLETE")
